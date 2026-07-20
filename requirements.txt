@@ -1,0 +1,10 @@
+# Physio Form Monitor dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Note: on Python 3.14 you need mediapipe >= 0.10.35 (first version with a
+# wheel that installs on 3.14). numpy is pulled in by opencv/mediapipe anyway.
+
+opencv-python
+mediapipe>=0.10.35
+numpy
+requests

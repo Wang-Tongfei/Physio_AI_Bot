@@ -1,0 +1,22 @@
+# --- Privacy: never upload recorded exercise footage ---
+clips/
+*.mp4
+*.avi
+
+# --- Python cruft ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+physio_env/
+
+# --- Secrets / local env (belt-and-braces; tokens come from env vars) ---
+.env
+*.token
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
