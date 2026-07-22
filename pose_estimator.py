@@ -1,10 +1,3 @@
-"""
-pose_estimator.py -- wraps MediaPipe so the rest of the app never touches it.
-
-Turns a webcam frame into a plain list of (x, y) body points in [0, 1]. If we
-ever swapped MediaPipe for another pose library (MoveNet, OpenPose, ...), only
-THIS file would change -- nothing downstream depends on MediaPipe's own types.
-"""
 import time
 
 import cv2

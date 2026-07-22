@@ -23,7 +23,11 @@ class Config:
     # pose model
     model_path: str = os.path.join(_HERE, "models", "pose_landmarker_lite.task")
 
-    # telegram (read from environment so no secret is stored in code) ---
+    # telegram (read from OS environment variables so no secret is in the code).
+    # Set them permanently for your Windows user with, e.g.:
+    #   [Environment]::SetEnvironmentVariable("PHYSIO_TG_TOKEN", "...", "User")
+    #   [Environment]::SetEnvironmentVariable("PHYSIO_TG_CHAT",  "...", "User")
+    # then restart your terminal / VS Code so new processes pick them up.
     telegram_token: str = field(
         default_factory=lambda: os.environ.get("PHYSIO_TG_TOKEN", "").strip())
     telegram_chat_id: str = field(

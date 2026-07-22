@@ -114,6 +114,7 @@ def main():
             print(f"Now tracking the {arm} arm.")
 
     # shutdown
+    notifier.flush()            # let any in-flight Telegram uploads finish
     source.release()
     cv2.destroyAllWindows()
     pose.close()
