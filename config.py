@@ -10,7 +10,9 @@ class Config:
     camera_index: int = 0                 # default built-in webcam
 
     # exercise + form thresholds (degrees)
+    exercise: str = "bicep_curl"           # bicep_curl, squat, plank, pushup
     target_reps: int = 10                 # session complete after this many good reps
+    plank_target_seconds: float = 30      # good-form hold time
     track_arm: str = "right"              # "right" or "left"
     extended_angle: float = 160           # arm counts as fully extended above this
     flexed_angle: float = 45              # arm counts as fully curled below this
@@ -22,6 +24,8 @@ class Config:
 
     # pose model
     model_path: str = os.path.join(_HERE, "models", "pose_landmarker_lite.task")
+    hand_model_path: str = os.path.join(_HERE, "models", "hand_landmarker.task")
+    enable_hand_tracking: bool = True
 
     # telegram (read from OS environment variables so no secret is in the code).
     # Set them permanently for your Windows user with, e.g.:
