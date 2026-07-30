@@ -13,6 +13,11 @@ from form_analysis import calculate_angle
 from pose_estimator import PoseLandmark
 
 
+READY_STABLE_FRAMES = 5
+TARGET_STABLE_FRAMES = 3
+RETURN_STABLE_FRAMES = 4
+
+
 @dataclass
 class AnalysisResult:
     status: str
@@ -85,6 +90,20 @@ def _has_upper_body_support(landmarks):
     return elbow_y > shoulder_y + 0.035 or wrist_y > shoulder_y + 0.055
 
 
+def _landmarks_reliable(
+    landmarks, indices, min_visibility=0.55, min_presence=0.50
+):
+    """Use confidence metadata when supplied by PoseEstimator.
+
+    Plain coordinate lists remain supported for tests and callers that do not
+    yet provide confidence metadata.
+    """
+    reliable = getattr(landmarks, "reliable", None)
+    if reliable is None:
+        return True
+    return reliable(indices, min_visibility, min_presence)
+
+
 class RepetitionAnalyzer:
     unit = "reps"
 
@@ -94,6 +113,8 @@ class RepetitionAnalyzer:
         self.progress = 0
         self._stage = "up"
         self._movement_started = False
+        self._invalid_pose_frames = 0
+        self._movement_started_at = None
 
     @property
     def is_complete(self):
@@ -103,6 +124,23 @@ class RepetitionAnalyzer:
         self.progress = 0
         self._stage = "up"
         self._movement_started = False
+        self._invalid_pose_frames = 0
+        self._movement_started_at = None
+
+    def _guard_pose(self, landmarks, indices, guidance):
+        if _landmarks_reliable(landmarks, indices):
+            self._invalid_pose_frames = 0
+            return None
+        self._invalid_pose_frames += 1
+        if self._invalid_pose_frames >= 2:
+            self._reset_incomplete_rep()
+        return AnalysisResult(guidance, False, "", None)
+
+    def _reset_incomplete_rep(self):
+        """Cancel only the current partial repetition; keep completed reps."""
+        self._stage = "up"
+        self._movement_started = False
+        self._movement_started_at = None
 
 
 class BicepCurlAnalyzer(RepetitionAnalyzer):
@@ -116,46 +154,83 @@ class BicepCurlAnalyzer(RepetitionAnalyzer):
         self._ready = False
         self._rep_valid = True
         self._bad_arm_position = False
+        self._extended_frames = 0
+        self._flexed_frames = 0
 
     def reset(self):
         super().reset()
         self._ready = False
         self._rep_valid = True
         self._bad_arm_position = False
+        self._extended_frames = 0
+        self._flexed_frames = 0
+
+    def _reset_incomplete_rep(self):
+        super()._reset_incomplete_rep()
+        self._ready = False
+        self._rep_valid = True
+        self._bad_arm_position = False
+        self._extended_frames = 0
+        self._flexed_frames = 0
 
     def update(self, landmarks, now=None):
         shoulder, elbow, wrist = PoseLandmark.arm_joints(self.arm)
-        angle = calculate_angle(landmarks[shoulder], landmarks[elbow],
-                                landmarks[wrist])
         hip = (PoseLandmark.LEFT_HIP if self.arm == "left"
                else PoseLandmark.RIGHT_HIP)
+        guard = self._guard_pose(
+            landmarks,
+            (shoulder, elbow, wrist, hip),
+            "Keep the tracked shoulder, arm and hip fully in view",
+        )
+        if guard:
+            return guard
+        now = time.monotonic() if now is None else now
+        angle = calculate_angle(landmarks[shoulder], landmarks[elbow],
+                                landmarks[wrist])
         upper_arm_angle = calculate_angle(
             landmarks[hip], landmarks[shoulder], landmarks[elbow])
         arm_position_ok = upper_arm_angle <= 35
         fault = None
 
-        if not self._movement_started and angle >= self.extended_angle:
+        self._extended_frames = (
+            self._extended_frames + 1 if angle >= self.extended_angle else 0
+        )
+        self._flexed_frames = (
+            self._flexed_frames + 1 if angle <= self.flexed_angle else 0
+        )
+
+        if (not self._movement_started
+                and self._extended_frames >= READY_STABLE_FRAMES):
             self._ready = True
         if (not self._movement_started and self._ready
                 and angle < self.extended_angle - 10):
             self._movement_started = True
+            self._movement_started_at = now
             self._stage = "curling"
             self._rep_valid = arm_position_ok
         if self._movement_started and not arm_position_ok:
             self._rep_valid = False
-        if self._movement_started and angle <= self.flexed_angle:
+        if (self._movement_started
+                and self._flexed_frames >= TARGET_STABLE_FRAMES):
             self._stage = "flexed"
 
-        if self._movement_started and angle >= self.extended_angle:
-            if self._stage == "flexed" and self._rep_valid:
+        if (self._movement_started
+                and self._extended_frames >= RETURN_STABLE_FRAMES):
+            duration = now - (self._movement_started_at or now)
+            if (self._stage == "flexed" and self._rep_valid
+                    and duration >= 0.6):
                 self.progress += 1
                 completed_good_rep = True
             else:
                 completed_good_rep = False
-                fault = ("upper_arm_drift" if not self._rep_valid
-                         else "partial_curl")
+                if duration < 0.6:
+                    fault = "movement_too_fast"
+                else:
+                    fault = ("upper_arm_drift" if not self._rep_valid
+                             else "partial_curl")
             self._stage = "up"
             self._movement_started = False
+            self._movement_started_at = None
             self._ready = True
             self._rep_valid = True
             if completed_good_rep:
@@ -172,9 +247,12 @@ class BicepCurlAnalyzer(RepetitionAnalyzer):
                 "Keep the upper arm close to the torso", False,
                 "Elbow", angle, fault)
         if fault:
-            message = ("Keep the upper arm close to the torso"
-                       if fault == "upper_arm_drift"
-                       else "Partial rep - curl all the way up")
+            if fault == "upper_arm_drift":
+                message = "Keep the upper arm close to the torso"
+            elif fault == "movement_too_fast":
+                message = "Move slowly and with control"
+            else:
+                message = "Partial rep - curl all the way up"
             return AnalysisResult(
                 message, False, "Elbow", angle, fault)
         if not self._ready:
@@ -194,14 +272,37 @@ class SquatAnalyzer(RepetitionAnalyzer):
         self._bad_asymmetry = False
         self._ready = False
         self._rep_valid = True
+        self._standing_frames = 0
+        self._depth_frames = 0
 
     def reset(self):
         super().reset()
         self._bad_asymmetry = False
         self._ready = False
         self._rep_valid = True
+        self._standing_frames = 0
+        self._depth_frames = 0
+
+    def _reset_incomplete_rep(self):
+        super()._reset_incomplete_rep()
+        self._ready = False
+        self._rep_valid = True
+        self._bad_asymmetry = False
+        self._standing_frames = 0
+        self._depth_frames = 0
 
     def update(self, landmarks, now=None):
+        required = (
+            PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP,
+            PoseLandmark.LEFT_KNEE, PoseLandmark.RIGHT_KNEE,
+            PoseLandmark.LEFT_ANKLE, PoseLandmark.RIGHT_ANKLE,
+        )
+        guard = self._guard_pose(
+            landmarks, required, "Keep both hips, knees and ankles in view"
+        )
+        if guard:
+            return guard
+        now = time.monotonic() if now is None else now
         knee_angle, left, right = _mean_joint_angle(
             landmarks,
             PoseLandmark.leg_joints("left"),
@@ -211,31 +312,48 @@ class SquatAnalyzer(RepetitionAnalyzer):
         asymmetry_bad = asymmetry > 20
         standing = left > 160 and right > 160
         fault = None
+        self._standing_frames = (
+            self._standing_frames + 1 if standing else 0
+        )
+        self._depth_frames = (
+            self._depth_frames + 1
+            if left <= 100 and right <= 100 else 0
+        )
 
-        if not self._movement_started and standing:
+        if (not self._movement_started
+                and self._standing_frames >= READY_STABLE_FRAMES):
             self._ready = True
 
         if (not self._movement_started and self._ready
                 and left < 145 and right < 145):
             self._movement_started = True
+            self._movement_started_at = now
             self._stage = "descending"
             self._rep_valid = not asymmetry_bad
 
         if self._movement_started and asymmetry_bad:
             self._rep_valid = False
-        if self._movement_started and left <= 100 and right <= 100:
+        if (self._movement_started
+                and self._depth_frames >= TARGET_STABLE_FRAMES):
             self._stage = "down"
 
-        if self._movement_started and standing:
-            if self._stage == "down" and self._rep_valid:
+        if (self._movement_started
+                and self._standing_frames >= RETURN_STABLE_FRAMES):
+            duration = now - (self._movement_started_at or now)
+            if (self._stage == "down" and self._rep_valid
+                    and duration >= 0.8):
                 self.progress += 1
                 completed_good_rep = True
             else:
                 completed_good_rep = False
-                fault = ("uneven_squat" if not self._rep_valid
-                         else "shallow_squat")
+                if duration < 0.8:
+                    fault = "movement_too_fast"
+                else:
+                    fault = ("uneven_squat" if not self._rep_valid
+                             else "shallow_squat")
             self._stage = "up"
             self._movement_started = False
+            self._movement_started_at = None
             self._ready = True
             self._rep_valid = True
             if completed_good_rep:
@@ -252,9 +370,12 @@ class SquatAnalyzer(RepetitionAnalyzer):
                 "Keep both knees moving evenly", False, "Knee", knee_angle,
                 fault)
         if fault:
-            message = ("Keep both knees moving evenly"
-                       if fault == "uneven_squat"
-                       else "Squat deeper before standing")
+            if fault == "uneven_squat":
+                message = "Keep both knees moving evenly"
+            elif fault == "movement_too_fast":
+                message = "Move slowly and with control"
+            else:
+                message = "Squat deeper before standing"
             return AnalysisResult(
                 message, False, "Knee", knee_angle,
                 fault)
@@ -275,14 +396,41 @@ class PushUpAnalyzer(RepetitionAnalyzer):
         self._bad_alignment = False
         self._ready = False
         self._rep_valid = True
+        self._extended_frames = 0
+        self._depth_frames = 0
 
     def reset(self):
         super().reset()
         self._bad_alignment = False
         self._ready = False
         self._rep_valid = True
+        self._extended_frames = 0
+        self._depth_frames = 0
+
+    def _reset_incomplete_rep(self):
+        super()._reset_incomplete_rep()
+        self._ready = False
+        self._rep_valid = True
+        self._bad_alignment = False
+        self._extended_frames = 0
+        self._depth_frames = 0
 
     def update(self, landmarks, now=None):
+        required = (
+            PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER,
+            PoseLandmark.LEFT_ELBOW, PoseLandmark.RIGHT_ELBOW,
+            PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST,
+            PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP,
+            PoseLandmark.LEFT_ANKLE, PoseLandmark.RIGHT_ANKLE,
+        )
+        guard = self._guard_pose(
+            landmarks,
+            required,
+            "Keep shoulders, arms, hips and ankles fully in view",
+        )
+        if guard:
+            return guard
+        now = time.monotonic() if now is None else now
         elbow_angle, left_elbow, right_elbow = _mean_joint_angle(
             landmarks,
             PoseLandmark.arm_joints("left"),
@@ -297,31 +445,48 @@ class PushUpAnalyzer(RepetitionAnalyzer):
             and supported
         )
         arms_extended = left_elbow >= 155 and right_elbow >= 155
+        self._extended_frames = (
+            self._extended_frames + 1
+            if arms_extended and posture_ok else 0
+        )
+        self._depth_frames = (
+            self._depth_frames + 1
+            if left_elbow <= 100 and right_elbow <= 100 else 0
+        )
 
-        if not self._movement_started and arms_extended and posture_ok:
+        if (not self._movement_started
+                and self._extended_frames >= READY_STABLE_FRAMES):
             self._ready = True
         if (not self._movement_started and self._ready
                 and left_elbow < 145 and right_elbow < 145):
             self._movement_started = True
+            self._movement_started_at = now
             self._stage = "descending"
             self._rep_valid = posture_ok
         if self._movement_started and not posture_ok:
             self._rep_valid = False
         if (self._movement_started
-                and left_elbow <= 100 and right_elbow <= 100):
+                and self._depth_frames >= TARGET_STABLE_FRAMES):
             self._stage = "down"
 
         fault = None
-        if arms_extended and self._movement_started:
-            if self._stage == "down" and self._rep_valid and posture_ok:
+        if (self._movement_started
+                and self._extended_frames >= RETURN_STABLE_FRAMES):
+            duration = now - (self._movement_started_at or now)
+            if (self._stage == "down" and self._rep_valid and posture_ok
+                    and duration >= 0.8):
                 self.progress += 1
                 completed_good_rep = True
             else:
                 completed_good_rep = False
-                fault = ("pushup_body_alignment" if not self._rep_valid
-                         else "shallow_pushup")
+                if duration < 0.8:
+                    fault = "movement_too_fast"
+                else:
+                    fault = ("pushup_body_alignment" if not self._rep_valid
+                             else "shallow_pushup")
             self._stage = "up"
             self._movement_started = False
+            self._movement_started_at = None
             self._ready = posture_ok
             self._rep_valid = True
             if completed_good_rep:
@@ -349,6 +514,10 @@ class PushUpAnalyzer(RepetitionAnalyzer):
         if fault == "shallow_pushup":
             return AnalysisResult(
                 "Lower until elbows reach about 90 degrees", False,
+                "Elbow", elbow_angle, fault)
+        if fault == "movement_too_fast":
+            return AnalysisResult(
+                "Move slowly and with control", False,
                 "Elbow", elbow_angle, fault)
         status = ("Good depth - push up" if self._stage == "down"
                   else (f"Push-up reps: {self.progress}/{self.target}"
@@ -386,6 +555,22 @@ class PlankAnalyzer:
         elapsed = 0.0 if self._last_time is None else min(now - self._last_time,
                                                           0.25)
         self._last_time = now
+
+        required = (
+            PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER,
+            PoseLandmark.LEFT_ELBOW, PoseLandmark.RIGHT_ELBOW,
+            PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST,
+            PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP,
+            PoseLandmark.LEFT_ANKLE, PoseLandmark.RIGHT_ANKLE,
+        )
+        if not _landmarks_reliable(landmarks, required):
+            self._invalid_seconds += elapsed
+            if self._invalid_seconds >= 0.75:
+                self._seconds = 0.0
+            self._bad_form = False
+            return AnalysisResult(
+                "Keep shoulders, arms, hips and ankles fully in view",
+                False, "", None)
 
         alignment = _body_alignment(landmarks)
         in_plank_position = _is_horizontal(landmarks)

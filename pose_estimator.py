@@ -30,6 +30,27 @@ class PoseLandmark:
         return cls.RIGHT_HIP, cls.RIGHT_KNEE, cls.RIGHT_ANKLE
 
 
+class PoseResult(list):
+    """Landmark coordinates plus MediaPipe confidence values.
+
+    It remains a normal list of ``(x, y)`` pairs for existing drawing and
+    angle code, while analyzers can reject inferred/off-screen joints.
+    """
+
+    def __init__(self, points, visibility, presence):
+        super().__init__(points)
+        self.visibility = visibility
+        self.presence = presence
+
+    def reliable(self, indices, min_visibility=0.55, min_presence=0.50):
+        return all(
+            0 <= index < len(self)
+            and self.visibility[index] >= min_visibility
+            and self.presence[index] >= min_presence
+            for index in indices
+        )
+
+
 class PoseEstimator:
     """Thin, single-responsibility wrapper around a MediaPipe PoseLandmarker."""
 
@@ -54,7 +75,12 @@ class PoseEstimator:
         result = self._landmarker.detect_for_video(image, timestamp_ms)
         if not result.pose_landmarks:
             return None
-        return [(lm.x, lm.y) for lm in result.pose_landmarks[0]]
+        landmarks = result.pose_landmarks[0]
+        return PoseResult(
+            [(lm.x, lm.y) for lm in landmarks],
+            [float(getattr(lm, "visibility", 0.0)) for lm in landmarks],
+            [float(getattr(lm, "presence", 0.0)) for lm in landmarks],
+        )
 
     def close(self):
         self._landmarker.close()
