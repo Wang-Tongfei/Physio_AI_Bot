@@ -1,6 +1,5 @@
 import enum
-
-import numpy as np
+import math
 
 
 def calculate_angle(a, b, c):
@@ -9,10 +8,9 @@ def calculate_angle(a, b, c):
     Each point is an (x, y) pair. Used for the elbow angle
     (shoulder -> elbow -> wrist).
     """
-    a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - \
-              np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(np.degrees(radians))
+    radians = math.atan2(c[1] - b[1], c[0] - b[0]) - \
+              math.atan2(a[1] - b[1], a[0] - b[0])
+    angle = abs(math.degrees(radians))
     if angle > 180.0:
         angle = 360.0 - angle
     return float(angle)

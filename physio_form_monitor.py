@@ -7,16 +7,19 @@ import cv2
 import hud
 from config import Config
 from camera import VideoSource
-from pose_estimator import PoseEstimator, PoseLandmark
-from form_analysis import RepCounter, RepEvent, calculate_angle
+from pose_estimator import PoseEstimator
+from hand_estimator import HandEstimator
+from exercise_analysis import BicepCurlAnalyzer, create_analyzer
 from clip_recorder import ClipRecorder
 from notifier import TelegramNotifier
 
 
-def elbow_angle(landmarks, arm):
-    """Elbow angle for the chosen arm, from the pose landmarks."""
-    shoulder, elbow, wrist = PoseLandmark.arm_joints(arm)
-    return calculate_angle(landmarks[shoulder], landmarks[elbow], landmarks[wrist])
+EXERCISE_KEYS = {
+    ord("1"): "bicep_curl",
+    ord("2"): "squat",
+    ord("3"): "plank",
+    ord("4"): "pushup",
+}
 
 
 def main():
@@ -34,8 +37,15 @@ def main():
         sys.exit(str(exc))
 
     pose = PoseEstimator(cfg.model_path)
-    counter = RepCounter(cfg.target_reps, cfg.extended_angle,
-                         cfg.flexed_angle, cfg.partial_up_angle)
+    hand_pose = None
+    if cfg.enable_hand_tracking:
+        if os.path.exists(cfg.hand_model_path):
+            hand_pose = HandEstimator(cfg.hand_model_path)
+        else:
+            print(f"Hand model not found at {cfg.hand_model_path}.")
+            print("Detailed hand tracking is disabled; body tracking will continue.")
+    exercise = cfg.exercise
+    analyzer = create_analyzer(exercise, cfg)
     recorder = ClipRecorder(cfg.clips_dir, source.fps, cfg.clip_buffer_seconds)
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
 
@@ -47,7 +57,8 @@ def main():
     last_fault_time = 0.0
 
     print(f"Physio Form Monitor running on {source.label}.")
-    print("Controls:  q=quit   r=reset   a=switch arm")
+    print("Controls: q=quit  r=reset  a=switch arm  "
+          "1=curl  2=squat  3=plank  4=push-up")
     if notifier.enabled:
         print("Telegram alerts: ENABLED")
         notifier.send_message("Physio Form Monitor: session started.")
@@ -62,65 +73,81 @@ def main():
         frame = cv2.flip(frame, 1)          # mirror so it feels like a mirror
 
         landmarks = pose.estimate(frame)
-        angle = None
+        hand_landmarks = hand_pose.estimate(frame) if hand_pose else []
+        metric_label = ""
+        metric_value = None
 
-        if landmarks is not None and not counter.is_complete:
-            angle = elbow_angle(landmarks, arm)
-            event = counter.update(angle)
-            if event is RepEvent.GOOD_REP:
-                form_ok = True
-                form_status = f"Good rep!  ({counter.reps}/{counter.target_reps})"
-            elif event is RepEvent.PARTIAL_REP:
-                form_ok = False
-                form_status = "Partial rep - curl all the way up!"
-                path = recorder.save("partial_rep")
+        if landmarks is not None and not analyzer.is_complete:
+            result = analyzer.update(landmarks)
+            metric_label = result.metric_label
+            metric_value = result.metric_value
+            form_ok = result.form_ok
+            form_status = result.status
+            if result.fault:
+                path = recorder.save(result.fault)
                 if path:
-                    print(f"[ALERT] Bad form (partial_rep). Clip saved: {path}")
+                    print(f"[ALERT] Bad form ({result.fault}). Clip saved: {path}")
                     notifier.send_video(
-                        path, caption="Physio alert: bad form (partial rep). Please review.")
+                        path,
+                        caption=f"Physio alert: {analyzer.name} - "
+                                f"{result.status}. Please review.")
                 last_fault_time = time.time()
-        elif landmarks is None and not counter.is_complete:
+        elif landmarks is None and not analyzer.is_complete:
             form_status = "Step into view of the camera"
             form_ok = True
 
         recorder.add(frame)                 # rolling buffer for the NEXT clip
 
-        if counter.is_complete and not notified_complete:
+        if analyzer.is_complete and not notified_complete:
             notifier.send_message(
-                f"Workout complete: {counter.reps}/{counter.target_reps} good reps.")
+                f"Workout complete: {analyzer.name} "
+                f"{analyzer.progress:.1f}/{analyzer.target:g} {analyzer.unit}.")
             print("[NOTIFY] Workout complete -> therapist notified.")
             notified_complete = True
 
         # draw + show (view layer only reads state)
         state = hud.HudState(
-            reps=counter.reps, target_reps=counter.target_reps, arm=arm,
-            angle=angle, form_status=form_status, form_ok=form_ok,
-            complete=counter.is_complete,
+            exercise=analyzer.name, progress=analyzer.progress,
+            target=analyzer.target, unit=analyzer.unit, arm=arm,
+            metric_label=metric_label, metric_value=metric_value,
+            form_status=form_status, form_ok=form_ok,
+            complete=analyzer.is_complete,
             fault_active=(time.time() - last_fault_time < 1.0),
-            landmarks=landmarks)
+            landmarks=landmarks, hand_landmarks=hand_landmarks)
         hud.draw(frame, state)
-        cv2.imshow("Physio Form Monitor  (q=quit  r=reset  a=switch arm)", frame)
+        cv2.imshow("Physio Monitor (1=curl 2=squat 3=plank 4=pushup)", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
         elif key == ord("r"):
-            counter.reset()
+            analyzer.reset()
             notified_complete = False
             form_status, form_ok = "Session reset", True
             print("Session reset.")
         elif key == ord("a"):
             arm = "left" if arm == "right" else "right"
+            if isinstance(analyzer, BicepCurlAnalyzer):
+                analyzer.arm = arm
             print(f"Now tracking the {arm} arm.")
+        elif key in EXERCISE_KEYS:
+            exercise = EXERCISE_KEYS[key]
+            analyzer = create_analyzer(exercise, cfg, arm)
+            notified_complete = False
+            form_status, form_ok = f"Switched to {analyzer.name}", True
+            print(f"Now tracking: {analyzer.name}.")
 
     # shutdown
     notifier.flush()            # let any in-flight Telegram uploads finish
     source.release()
     cv2.destroyAllWindows()
     pose.close()
+    if hand_pose:
+        hand_pose.close()
     print("\n--- Session summary ---")
-    print(f"Reps completed: {counter.reps}/{counter.target_reps}")
-    print(f"Workout complete: {'YES' if counter.is_complete else 'no'}")
+    print(f"{analyzer.name}: {analyzer.progress:.1f}/{analyzer.target:g} "
+          f"{analyzer.unit}")
+    print(f"Workout complete: {'YES' if analyzer.is_complete else 'no'}")
 
 
 if __name__ == "__main__":
